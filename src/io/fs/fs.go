@@ -263,3 +263,19 @@ func (e *PathError) Timeout() bool {
 	t, ok := e.Err.(interface{ Timeout() bool })
 	return ok && t.Timeout()
 }
+
+// LinkError records an error during a link or symlink or rename.
+type LinkError struct {
+	Op  string
+	Old string
+	New string
+	Err error
+}
+
+func (e *LinkError) Error() string {
+	return e.Op + " " + e.Old + " " + e.New + ": " + e.Err.Error()
+}
+
+func (e *LinkError) Unwrap() error {
+	return e.Err
+}

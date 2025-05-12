@@ -34,10 +34,11 @@ type MapFS map[string]*MapFile
 
 // A MapFile describes a single file in a [MapFS].
 type MapFile struct {
-	Data    []byte      // file content or symlink destination
-	Mode    fs.FileMode // fs.FileInfo.Mode
-	ModTime time.Time   // fs.FileInfo.ModTime
-	Sys     any         // fs.FileInfo.Sys
+	Data     []byte      // file content or symlink destination
+	Mode     fs.FileMode // fs.FileInfo.Mode
+	ModTime  time.Time   // fs.FileInfo.ModTime
+	Sys      any         // fs.FileInfo.Sys
+	UID, GID int
 }
 
 var _ fs.FS = MapFS(nil)
@@ -57,6 +58,84 @@ func (fsys MapFS) Open(name string) (fs.File, error) {
 	file := fsys[realName]
 	if file != nil && file.Mode&fs.ModeDir == 0 {
 		// Ordinary file
+		return &openMapFile{name, mapFileInfo{path.Base(name), file}, 0}, nil
+	}
+
+	// Directory, possibly synthesized.
+	// Note that file can be nil here: the map need not contain explicit parent directories for all its files.
+	// But file can also be non-nil, in case the user wants to set metadata for the directory explicitly.
+	// Either way, we need to construct the list of children of this directory.
+	var list []mapFileInfo
+	var need = make(map[string]bool)
+	if realName == "." {
+		for fname, f := range fsys {
+			i := strings.Index(fname, "/")
+			if i < 0 {
+				if fname != "." {
+					list = append(list, mapFileInfo{fname, f})
+				}
+			} else {
+				need[fname[:i]] = true
+			}
+		}
+	} else {
+		prefix := realName + "/"
+		for fname, f := range fsys {
+			if strings.HasPrefix(fname, prefix) {
+				felem := fname[len(prefix):]
+				i := strings.Index(felem, "/")
+				if i < 0 {
+					list = append(list, mapFileInfo{felem, f})
+				} else {
+					need[fname[len(prefix):len(prefix)+i]] = true
+				}
+			}
+		}
+		// If the directory name is not in the map,
+		// and there are no children of the name in the map,
+		// then the directory is treated as not existing.
+		if file == nil && list == nil && len(need) == 0 {
+			return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+		}
+	}
+	for _, fi := range list {
+		delete(need, fi.name)
+	}
+	for name := range need {
+		list = append(list, mapFileInfo{name, &MapFile{Mode: fs.ModeDir | 0555}})
+	}
+	slices.SortFunc(list, func(a, b mapFileInfo) int {
+		return strings.Compare(a.name, b.name)
+	})
+
+	if file == nil {
+		file = &MapFile{Mode: fs.ModeDir | 0555}
+	}
+	var elem string
+	if name == "." {
+		elem = "."
+	} else {
+		elem = name[strings.LastIndex(name, "/")+1:]
+	}
+	return &mapDir{name, mapFileInfo{elem, file}, list, 0}, nil
+}
+
+func (fsys MapFS) OpenFile(name string, flag int, perm fs.FileMode) (fs.WriterFile, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+	realName, ok := fsys.resolveSymlinks(name)
+	if !ok {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+
+	file := fsys[realName]
+	if file != nil && file.Mode&fs.ModeDir == 0 {
+		// Ordinary file
+		return &openMapFile{name, mapFileInfo{path.Base(name), file}, 0}, nil
+	} else if flag&fs.O_CREATE > 0 && perm&fs.ModeDir == 0 {
+		file = &MapFile{[]byte{}, perm, time.Now(), nil, 0, 0}
+		fsys[realName] = file
 		return &openMapFile{name, mapFileInfo{path.Base(name), file}, 0}, nil
 	}
 
@@ -231,6 +310,194 @@ func (fsys MapFS) Glob(pattern string) ([]string, error) {
 	return fs.Glob(fsOnly{fsys}, pattern)
 }
 
+func (fsys MapFS) Mkdir(name string, perm fs.FileMode) error {
+	if !fs.ValidPath(name) {
+		return fs.ErrNotExist
+	}
+
+	realDir, ok := fsys.resolveSymlinks(path.Dir(name))
+	if !ok {
+		return fs.ErrNotExist
+	} else if _, ok := fsys[realDir]; !ok {
+		return fs.ErrNotExist
+	}
+
+	elem := path.Base(name)
+	realName := path.Join(realDir, elem)
+	fsys[realName] = &MapFile{
+		Data:    nil,
+		Mode:    fs.ModeDir | 0777,
+		ModTime: time.Now(),
+		Sys:     nil,
+	}
+
+	return nil
+}
+
+func (fsys MapFS) MkdirAll(name string, perm fs.FileMode) error {
+	if !fs.ValidPath(name) {
+		return fs.ErrNotExist
+	}
+
+	// Fast path: if we can tell whether path is a directory or file, stop with success or error.
+	dir, err := fsys.Stat(name)
+	if err == nil {
+		if dir.IsDir() {
+			return nil
+		}
+		return &fs.PathError{Op: "mkdir", Path: name, Err: fs.ErrNotExist}
+	}
+
+	// Slow path: make sure parent exists and then call Mkdir for path.
+
+	// Extract the parent folder from path by first removing any trailing
+	// path separator and then scanning backward until finding a path
+	// separator or reaching the beginning of the string.
+	i := len(name) - 1
+	for i >= 0 && name[i] == '/' {
+		i--
+	}
+	for i >= 0 && name[i] != '/' {
+		i--
+	}
+	if i < 0 {
+		i = 0
+	}
+
+	// If there is a parent directory, and it is not the volume name,
+	// recurse to ensure parent directory exists.
+	if parent := name[:i]; len(parent) > len(name) {
+		err = fsys.MkdirAll(parent, perm)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Parent now exists; invoke Mkdir and use its result.
+	err = fsys.Mkdir(name, perm)
+	if err != nil {
+		// Handle arguments like "foo/." by
+		// double-checking that directory doesn't exist.
+		dir, err1 := fsys.Lstat(name)
+		if err1 == nil && dir.IsDir() {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (fsys MapFS) Remove(name string) error {
+	if !fs.ValidPath(name) {
+		return fs.ErrNotExist
+	}
+
+	realDir, ok := fsys.resolveSymlinks(name)
+	if !ok {
+		return fs.ErrNotExist
+	}
+	info, err := fsys.Stat(realDir)
+	if err != nil {
+		return err
+	} else if info.IsDir() {
+		entrys, err := fsys.ReadDir(realDir)
+		if err != nil {
+			return err
+		} else if len(entrys) > 0 {
+			return &fs.PathError{Op: "remove", Path: realDir, Err: fs.ErrInvalid}
+		}
+	}
+	delete(fsys, realDir)
+	return nil
+}
+
+func (fsys MapFS) RemoveAll(name string) error {
+	if name == "." || !fs.ValidPath(name) {
+		return &fs.PathError{Op: "RemoveAll", Path: name, Err: fs.ErrInvalid}
+	}
+
+	err := &fs.PathError{Op: "RemoveAll", Path: name, Err: fs.ErrNotExist}
+	for pathName := range fsys {
+		if strings.HasPrefix(pathName, name) {
+			err = nil
+			delete(fsys, name)
+		}
+	}
+
+	return err
+}
+
+func (fsys MapFS) Symlink(oldname, newname string) error { return fsys.Link(oldname, newname) }
+func (fsys MapFS) Link(oldname, newname string) error {
+	if !fs.ValidPath(oldname) {
+		return &fs.PathError{Op: "link", Path: oldname, Err: fs.ErrInvalid}
+	} else if !fs.ValidPath(newname) {
+		return &fs.PathError{Op: "link", Path: newname, Err: fs.ErrInvalid}
+	}
+
+	oldname, ok := fsys.resolveSymlinks(oldname)
+	if !ok {
+		return &fs.PathError{Op: "link", Path: newname, Err: fs.ErrNotExist}
+	}
+
+	if _, ok := fsys[oldname]; !ok {
+		return &fs.PathError{Op: "link", Path: oldname, Err: fs.ErrNotExist}
+	} else if _, ok := fsys[newname]; !ok {
+		return &fs.PathError{Op: "link", Path: newname, Err: fs.ErrInvalid}
+	}
+
+	fsys[newname] = &MapFile{
+		Data:    []byte(oldname),
+		Mode:    fs.ModeSymlink,
+		ModTime: fsys[oldname].ModTime,
+		Sys:     fsys[oldname].Sys,
+	}
+	return nil
+}
+
+func (fsys MapFS) Chmod(name string, mode fs.FileMode) error {
+	if !fs.ValidPath(name) {
+		return &fs.PathError{Op: "chmod", Path: name, Err: fs.ErrInvalid}
+	}
+
+	name, ok := fsys.resolveSymlinks(name)
+	if !ok || fsys[name] == nil {
+		return &fs.PathError{Op: "chmod", Path: name, Err: fs.ErrNotExist}
+	}
+
+	fsys[name].Mode = (fsys[name].Mode.Perm() & fsys[name].Mode) | mode.Perm()
+	return nil
+}
+
+func (fsys MapFS) Chown(name string, uid, gid int) error {
+	if !fs.ValidPath(name) {
+		return &fs.PathError{Op: "chown", Path: name, Err: fs.ErrInvalid}
+	}
+	name, ok := fsys.resolveSymlinks(name)
+	if !ok || fsys[name] == nil {
+		return &fs.PathError{Op: "chown", Path: name, Err: fs.ErrNotExist}
+	}
+	if uid >= 0 {
+		fsys[name].UID = uid
+	}
+	if gid >= 0 {
+		fsys[name].GID = gid
+	}
+	return nil
+}
+
+func (fsys MapFS) Chtimes(name string, _ time.Time, mtime time.Time) error {
+	if !fs.ValidPath(name) {
+		return &fs.PathError{Op: "chtime", Path: name, Err: fs.ErrInvalid}
+	}
+	name, ok := fsys.resolveSymlinks(name)
+	if !ok || fsys[name] == nil {
+		return &fs.PathError{Op: "chtime", Path: name, Err: fs.ErrNotExist}
+	}
+	fsys[name].ModTime = mtime
+	return nil
+}
+
 type noSub struct {
 	MapFS
 }
@@ -310,6 +577,44 @@ func (f *openMapFile) ReadAt(b []byte, offset int64) (int, error) {
 	return n, nil
 }
 
+func (f *openMapFile) WriteAt(b []byte, offset int64) (int, error) {
+	if offset < 0 || offset < int64(len(f.f.Data)) {
+		return 0, &fs.PathError{Op: "write", Path: f.path, Err: fs.ErrInvalid}
+	}
+
+	at, before := f.f.Data[offset:], f.f.Data[:offset]
+	switch {
+	case len(before) > len(b):
+		before = before[len(b):]
+	default:
+		before = before[:0]
+	}
+	f.f.Data = append(at, append(b, before...)...)
+	return len(b), nil
+}
+
+func (f *openMapFile) Write(b []byte) (int, error) {
+	at, before := f.f.Data[f.offset:], f.f.Data[:f.offset]
+	switch {
+	case len(before) > len(b):
+		before = before[len(b):]
+	default:
+		before = before[:0]
+	}
+	f.f.Data = append(at, append(b, before...)...)
+	f.offset += int64(len(b))
+	return len(b), nil
+}
+
+func (f *openMapFile) Truncate(size int64) error {
+	if int64(len(f.f.Data)) > size {
+		f.f.Data = f.f.Data[:size]
+		return nil
+	}
+	f.f.Data = append(f.f.Data, make([]byte, size-int64(len(f.f.Data)))...)
+	return nil
+}
+
 // A mapDir is a directory fs.File (so also an fs.ReadDirFile) open for reading.
 type mapDir struct {
 	path string
@@ -323,6 +628,9 @@ func (d *mapDir) Close() error               { return nil }
 func (d *mapDir) Read(b []byte) (int, error) {
 	return 0, &fs.PathError{Op: "read", Path: d.path, Err: fs.ErrInvalid}
 }
+
+func (mapDir) Write([]byte) (int, error) { return 0, io.EOF }
+func (mapDir) Truncate(size int64) error { return io.EOF }
 
 func (d *mapDir) ReadDir(count int) ([]fs.DirEntry, error) {
 	n := len(d.entry) - d.offset
